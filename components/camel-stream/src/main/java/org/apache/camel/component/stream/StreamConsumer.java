@@ -16,17 +16,14 @@
  */
 package org.apache.camel.component.stream;
 
-import java.io.BufferedReader;
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
+import java.io.*;
 import java.net.URL;
 import java.net.URLConnection;
 import java.nio.charset.Charset;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 
 import org.apache.camel.Exchange;
@@ -37,6 +34,8 @@ import org.apache.camel.impl.DefaultMessage;
 import org.apache.camel.util.ObjectHelper;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.apache.log4j.*;
+import org.apache.log4j.spi.LoggerRepository;
 
 /**
  * Consumer that can read from streams
@@ -52,6 +51,11 @@ public class StreamConsumer extends DefaultConsumer implements Runnable {
     private StreamEndpoint endpoint;
     private String uri;
     private boolean initialPromptDone;
+    private BufferedReader br;
+    private Map<String,Long> rolledFilesDate = new HashMap<String, Long>();
+    private String nameOfFile;
+    private File parentFile;
+    private String basename;
 
     public StreamConsumer(StreamEndpoint endpoint, Processor processor, String uri) throws Exception {
         super(endpoint, processor);
@@ -64,7 +68,7 @@ public class StreamConsumer extends DefaultConsumer implements Runnable {
     protected void doStart() throws Exception {
         super.doStart();
 
-        initializeStream();
+        br = initializeStream();
 
         executor = endpoint.getCamelContext().getExecutorServiceStrategy().newSingleThreadExecutor(this, endpoint.getEndpointUri());
         executor.execute(this);
@@ -98,13 +102,11 @@ public class StreamConsumer extends DefaultConsumer implements Runnable {
             inputStream = resolveStreamFromUrl();
         }
         Charset charset = endpoint.getCharset();
-        BufferedReader br = new BufferedReader(new InputStreamReader(inputStream, charset));
-        return br;
+        return new BufferedReader(new InputStreamReader(inputStream, charset));
     }
 
     private void readFromStream() throws Exception {
         String line;
-        BufferedReader br = initializeStream();
 
         if (endpoint.isScanStream()) {
             // repeat scanning from stream
@@ -118,7 +120,21 @@ public class StreamConsumer extends DefaultConsumer implements Runnable {
                     processLine(line);
                 } else if (eos && isRunAllowed()) {
                     //try and re-open stream
-                    br = initializeStream();
+                    if (inputStream instanceof FileInputStream) {
+                        final File[] files = parentFile.listFiles(new FilenameFilter() {
+                            public boolean accept(File dir, String name) {
+                                return !name.equals(nameOfFile) && name.startsWith(basename);
+                            }
+                        });
+                        for (File file1 : files) {
+                            if(rolledFilesDate.isEmpty() ||
+                               (rolledFilesDate.containsKey(file1.getName()) && file1.lastModified() > rolledFilesDate.get(file1.getName()))) {
+                                br = initializeStream();
+                                break;
+                            }
+                        }
+
+                    }
                 }
                 try {
                     Thread.sleep(endpoint.getScanStreamDelay());
@@ -201,9 +217,29 @@ public class StreamConsumer extends DefaultConsumer implements Runnable {
     private InputStream resolveStreamFromFile() throws IOException {
         String fileName = endpoint.getFileName();
         ObjectHelper.notEmpty(fileName, "fileName");
-        
-        FileInputStream fileStream;
 
+        FileInputStream fileStream;
+        if(fileName.startsWith("log4j")) {
+            String[] strings = fileName.split("_");
+            if(strings.length==3) {
+                LoggerRepository loggerRepository = LogManager.getLoggerRepository();
+                org.apache.log4j.Logger logger4j = loggerRepository.getLogger(strings[1]);
+                if(logger4j != null) {
+                    LOG.debug(logger4j.getName());
+                    LOG.debug(logger4j.getAppender(strings[2]));
+                    URL resource = Thread.currentThread().getContextClassLoader().getResource(
+                            ((FileAppender) logger4j.getAppender(strings[2])).getFile());
+                    if(resource!=null) {
+                        fileName = resource.getFile();
+                    } else {
+                        LOG.debug("Could not find resource for "+logger4j.getAppender(strings[2])+" file object = "+new File(((FileAppender) logger4j.getAppender(strings[2])).getFile()).getAbsolutePath());
+                        fileName=new File(((FileAppender) logger4j.getAppender(strings[2])).getFile()).getAbsolutePath();
+                    }
+                } else {
+                    LOG.fatal("log4j logger not found for "+strings[1]);
+                }
+            }
+        }
         File file = new File(fileName);
 
         if (LOG.isDebugEnabled()) {
@@ -212,6 +248,17 @@ public class StreamConsumer extends DefaultConsumer implements Runnable {
 
         if (file.canRead()) {
             fileStream = new FileInputStream(file);
+            nameOfFile = file.getName();
+            basename = nameOfFile.substring(0,nameOfFile.lastIndexOf("."));
+            parentFile = file.getParentFile();
+            final File[] files = parentFile.listFiles(new FilenameFilter() {
+                public boolean accept(File dir, String name) {
+                    return !name.equals(nameOfFile) && name.startsWith(basename);
+                }
+            });
+            for (File file1 : files) {
+                rolledFilesDate.put(file1.getName(),file1.lastModified());
+            }
         } else {
             throw new IllegalArgumentException(INVALID_URI);
         }
@@ -234,7 +281,6 @@ public class StreamConsumer extends DefaultConsumer implements Runnable {
         if (this.uri.startsWith("//")) {
             this.uri = this.uri.substring(2);
         }
-        
         if (!TYPES_LIST.contains(this.uri)) {
             throw new IllegalArgumentException(INVALID_URI);
         }
